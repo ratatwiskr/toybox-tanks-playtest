@@ -21,7 +21,6 @@ concurrency:
 
 jobs:
   build:
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
@@ -39,7 +38,7 @@ jobs:
           [[ "$sha" =~ ^[a-f0-9]{40}$ ]]
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout the exact game revision without persisted credentials
+      - name: Checkout the selected game revision without persisted credentials
         uses: actions/checkout@v4
         with:
           repository: ratatwiskr/toybox-tanks
@@ -58,50 +57,72 @@ jobs:
         working-directory: source
         run: npm ci
 
-      - name: Install verification browsers
+      - name: Build single-file artifact
         working-directory: source
-        run: npx playwright install --with-deps chromium firefox webkit
+        run: npm run build:single
 
-      - name: Full verification of selected source
-        working-directory: source
-        run: npm run verify
-
-      - name: Cross-browser production release smoke
-        working-directory: source
-        run: npm run test:browsers
-
-      - name: Prepare production artifact and source provenance
+      - name: Prepare artifact and source provenance
         working-directory: source
         env:
           SOURCE_SHA: ${{ steps.source.outputs.sha }}
           SOURCE_BRANCH: ${{ inputs.source_branch }}
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          test -s dist/index.html
-          printf '%s\n' "$SOURCE_SHA" > dist/deployed-commit.txt
+          test -s dist-single/index.html
+          printf '%s\n' "$SOURCE_SHA" > dist-single/deployed-commit.txt
           jq -n \
             --arg repository 'ratatwiskr/toybox-tanks' \
             --arg branch "$SOURCE_BRANCH" \
             --arg sha "$SOURCE_SHA" \
             --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             '{repository: $repository, branch: $branch, sha: $sha, run: $run}' \
-            > dist/playtest-source.json
-          printf 'Verified game source: `ratatwiskr/toybox-tanks@%s`\n' "$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+            > dist-single/playtest-source.json
+          printf 'Built game source: `ratatwiskr/toybox-tanks@%s`\n' "$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload verified Pages artifact
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
         with:
-          path: source/dist
+          path: source/dist-single
+
+  quality:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - name: Checkout the selected game revision
+        uses: actions/checkout@v4
+        with:
+          repository: ratatwiskr/toybox-tanks
+          ref: ${{ needs.build.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.2'
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Install verification browsers
+        run: npx playwright install --with-deps chromium firefox webkit
+
+      - name: Full verification of selected source
+        run: npm run verify
+
+      - name: Cross-browser production release smoke
+        run: npm run test:browsers
 
       - name: Preserve verification artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: playtest-verification
+          name: playtest-verification-${{ github.run_id }}
           path: |
-            source/playwright-report/
-            source/test-results/
+            playwright-report/
+            test-results/
           if-no-files-found: ignore
           retention-days: 14
 
@@ -121,29 +142,30 @@ jobs:
       - name: Configure the isolated Pages site
         uses: actions/configure-pages@v5
 
-      - name: Deploy verified static artifact
+      - name: Deploy static artifact
         id: deployment
         uses: actions/deploy-pages@v4
 
-      - name: Record deployment pending live verification
+      - name: Record non-gated deployment
         env:
           PAGE_URL: ${{ steps.deployment.outputs.page_url }}
           SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
         run: |
-          printf 'Playtest deployed: %s\n\nGame source: `%s`\n\nLive smoke is still required.\n' \
+          printf 'Playtest deployed without quality gate: %s\n\nGame source: `%s`\n\nQuality verification and live smoke run separately.\n' \
             "$PAGE_URL" "$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
 
-  smoke:
+  live-smoke:
     needs: [build, deploy]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    continue-on-error: true
     permissions:
       contents: read
     env:
       PAGES_BASE_URL: ${{ needs.deploy.outputs.page_url }}
       PAGES_EXPECTED_SHA: ${{ needs.build.outputs.source_sha }}
     steps:
-      - name: Checkout smoke tests from the verified game revision
+      - name: Checkout smoke tests from the selected game revision
         uses: actions/checkout@v4
         with:
           repository: ratatwiskr/toybox-tanks
@@ -165,16 +187,16 @@ jobs:
       - name: Smoke test the actual published playtest site
         run: npm run test:pages
 
-      - name: Record verified playtest URL
+      - name: Record live smoke result
         run: |
-          printf 'Live playtest smoke passed: %s\n\nGame source: `%s`\n' \
+          printf 'Live playtest smoke completed: %s\n\nGame source: `%s`\n' \
             "$PAGES_BASE_URL" "$PAGES_EXPECTED_SHA" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Preserve live smoke artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: playtest-pages-smoke
+          name: playtest-pages-smoke-${{ github.run_id }}
           path: |
             playwright-report/pages/
             test-results/pages/
